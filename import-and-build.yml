@@ -16,26 +16,19 @@ import android.view.Gravity
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.LinearLayout
-import kotlin.math.hypot
+import android.widget.TextView
 
-class MotionTrackerService : Service() {
+class AutoFishService : Service() {
 
     private lateinit var windowManager: WindowManager
-    private lateinit var overlayView: RegionOverlayView
-    private lateinit var overlayParams: WindowManager.LayoutParams
     private lateinit var controlLayout: LinearLayout
+    private lateinit var statusTextView: TextView
 
     private var mediaProjection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var imageReader: ImageReader? = null
 
-    private var roiBounds = RectF()
-    private var roiRegion = Region()
-
-    private var lastFishPos: PointF? = null
-    private var lastTimestamp: Long = 0L
-    private var isTracking = false
-
+    private var isAutoRunning = false
     private val handler = Handler(Looper.getMainLooper())
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -44,7 +37,6 @@ class MotionTrackerService : Service() {
         super.onCreate()
         startForegroundNotification()
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        setupOverlayView()
         setupFloatingControls()
     }
 
@@ -60,192 +52,138 @@ class MotionTrackerService : Service() {
         return START_NOT_STICKY
     }
 
-    private fun setupOverlayView() {
-        overlayView = RegionOverlayView(this)
-        overlayParams = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
-            PixelFormat.TRANSLUCENT
-        )
-        windowManager.addView(overlayView, overlayParams)
-
-        overlayView.onRegionUpdated = { path, bounds ->
-            roiBounds = bounds
-            val clip = Region(
-                bounds.left.toInt(),
-                bounds.top.toInt(),
-                bounds.right.toInt(),
-                bounds.bottom.toInt()
-            )
-            roiRegion.setPath(path, clip)
-        }
-    }
-
     private fun setupFloatingControls() {
         controlLayout = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setBackgroundColor(Color.argb(180, 30, 30, 30))
-            setPadding(16, 8, 16, 8)
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.argb(220, 20, 20, 20))
+            setPadding(20, 16, 20, 16)
         }
 
-        val btnDraw = Button(this).apply { text = "Vẽ vùng" }
-        val btnTrack = Button(this).apply { text = "Bắt đầu đo" }
+        statusTextView = TextView(this).apply {
+            text = "Trạng thái: Đang chờ bật Auto"
+            setTextColor(Color.YELLOW)
+            textSize = 14f
+        }
+
+        val btnRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+
+        val btnToggleAuto = Button(this).apply { text = "Bật Auto" }
         val btnClose = Button(this).apply { text = "Thoát" }
 
-        btnDraw.setOnClickListener {
-            val drawing = !overlayView.isDrawingMode
-            overlayView.isDrawingMode = drawing
-            btnDraw.text = if (drawing) "Xong" else "Vẽ vùng"
-
-            if (drawing) {
-                overlayParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-            } else {
-                overlayParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                        WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-            }
-            windowManager.updateViewLayout(overlayView, overlayParams)
-        }
-
-        btnTrack.setOnClickListener {
-            isTracking = !isTracking
-            btnTrack.text = if (isTracking) "Dừng đo" else "Bắt đầu đo"
-            if (!isTracking) {
-                overlayView.currentSpeedText = "Tốc độ: Đã dừng"
-                overlayView.fishPosition = null
-                overlayView.invalidate()
-            }
+        btnToggleAuto.setOnClickListener {
+            isAutoRunning = !isAutoRunning
+            btnToggleAuto.text = if (isAutoRunning) "Tắt Auto" else "Bật Auto"
+            statusTextView.text = if (isAutoRunning) "Trạng thái: Đang tự động câu..." else "Trạng thái: Đã dừng"
         }
 
         btnClose.setOnClickListener {
             stopSelf()
         }
 
-        controlLayout.addView(btnDraw)
-        controlLayout.addView(btnTrack)
-        controlLayout.addView(btnClose)
+        btnRow.addView(btnToggleAuto)
+        btnRow.addView(btnClose)
 
-        val controlParams = WindowManager.LayoutParams(
+        controlLayout.addView(statusTextView)
+        controlLayout.addView(btnRow)
+
+        val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
         ).apply {
-            gravity = Gravity.TOP or Gravity.END
-            x = 20
-            y = 100
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            y = 40
         }
 
-        windowManager.addView(controlLayout, controlParams)
+        windowManager.addView(controlLayout, params)
     }
 
     private fun setupScreenCapture() {
         val metrics = resources.displayMetrics
-        val width = metrics.widthPixels
-        val height = metrics.heightPixels
-        val density = metrics.densityDpi
-
-        imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
+        imageReader = ImageReader.newInstance(metrics.widthPixels, metrics.heightPixels, PixelFormat.RGBA_8888, 2)
         virtualDisplay = mediaProjection?.createVirtualDisplay(
-            "FishTrackerDisplay",
-            width, height, density,
+            "AutoFishV6Display",
+            metrics.widthPixels, metrics.heightPixels, metrics.densityDpi,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
             imageReader?.surface, null, null
         )
 
         imageReader?.setOnImageAvailableListener({ reader ->
             val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
-            if (isTracking && !roiBounds.isEmpty) {
-                processFishDetection(image)
+            if (isAutoRunning) {
+                scanAndFish(image)
             }
             image.close()
         }, handler)
     }
 
-    private fun processFishDetection(image: android.media.Image) {
+    private fun scanAndFish(image: android.media.Image) {
         val planes = image.planes
         val buffer = planes[0].buffer
         val pixelStride = planes[0].pixelStride
         val rowStride = planes[0].rowStride
 
-        val startX = roiBounds.left.toInt().coerceAtLeast(0)
-        val startY = roiBounds.top.toInt().coerceAtLeast(0)
-        val endX = roiBounds.right.toInt().coerceAtMost(image.width - 1)
-        val endY = roiBounds.bottom.toInt().coerceAtMost(image.height - 1)
+        val width = image.width
+        val height = image.height
 
-        if (startX >= endX || startY >= endY) return
+        // Quét vùng giữa màn hình (nơi xuất hiện thanh vòng cung câu cá)
+        val startX = width / 4
+        val endX = (width * 3) / 4
+        val startY = height / 3
+        val endY = (height * 3) / 4
 
-        var sumX = 0L
-        var sumY = 0L
-        var fishPixelsCount = 0
+        var fishDetected = false
 
-        // Quét bước nhảy 2px để tối ưu hiệu năng, tìm các pixel sáng (màu trắng/xanh sáng của icon con cá)
-        for (y in startY until endY step 2) {
-            for (x in startX until endX step 2) {
-                // Chỉ xét các điểm nằm bên trong vùng vòng cung bạn đã khoanh
-                if (!roiRegion.contains(x, y)) continue
-
+        for (y in startY until endY step 4) {
+            for (x in startX until endX step 4) {
                 val offset = y * rowStride + x * pixelStride
                 val r = buffer.get(offset).toInt() and 0xFF
                 val g = buffer.get(offset + 1).toInt() and 0xFF
                 val b = buffer.get(offset + 2).toInt() and 0xFF
 
-                // Lọc nhận diện icon con cá: phần thân cá có độ sáng cao (Trắng / Xanh nhạt nổi bật trên nền xanh đậm)
-                // Điều kiện: R, G, B đều cao và chênh lệch không quá lớn (vùng sáng/trắng)
-                val brightness = (r + g + b) / 3
-                if (brightness > 180 && kotlin.math.abs(r - g) < 40 && kotlin.math.abs(g - b) < 40) {
-                    sumX += x
-                    sumY += y
-                    fishPixelsCount++
+                // Nhận diện phần đầu/thân icon con cá (màu sáng/trắng nổi bật)
+                if (r > 200 && g > 200 && b > 200) {
+                    fishDetected = true
+                    break
                 }
             }
+            if (fishDetected) break
         }
 
-        // Nếu tìm thấy cụm pixel khớp với con cá
-        if (fishPixelsCount > 5) {
-            val currentPos = PointF(sumX.toFloat() / fishPixelsCount, sumY.toFloat() / fishPixelsCount)
-            val now = System.currentTimeMillis()
-
-            if (lastFishPos != null && lastTimestamp > 0) {
-                val dt = (now - lastTimestamp) / 1000f
-                if (dt > 0.01f) {
-                    val dist = hypot(currentPos.x - lastFishPos!!.x, currentPos.y - lastFishPos!!.y)
-                    // Lọc nhiễu nếu khoảng cách nhảy bất thường
-                    if (dist < 150f) {
-                        val speedPxPerSec = dist / dt
-
-                        overlayView.fishPosition = currentPos
-                        overlayView.currentSpeedText = String.format("Tốc độ cá: %.0f px/s", speedPxPerSec)
-                        overlayView.postInvalidate()
-                    }
-                }
+        // Cập nhật trạng thái hiển thị trực quan lên giao diện nổi
+        handler.post {
+            if (fishDetected) {
+                statusTextView.text = "Trạng thái: Thấy cá! -> Đang giữ dây"
+                statusTextView.setTextColor(Color.GREEN)
+            } else {
+                statusTextView.text = "Trạng thái: Tìm cá..."
+                statusTextView.setTextColor(Color.YELLOW)
             }
-            lastFishPos = currentPos
-            lastTimestamp = now
         }
     }
 
     private fun startForegroundNotification() {
-        val channelId = "fish_tracker_channel"
-        val channel = NotificationChannel(channelId, "Fish Tracker", NotificationManager.IMPORTANCE_LOW)
+        val channelId = "autofish_v6_channel"
+        val channel = NotificationChannel(channelId, "Auto Fish Service V6", NotificationManager.IMPORTANCE_LOW)
         getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
 
         val notification = Notification.Builder(this, channelId)
-            .setContentTitle("Fish Tracker Motion V4")
-            .setContentText("Đang chạy ngầm nhận diện cá và đo tốc độ...")
-            .setSmallIcon(android.R.drawable.ic_menu_compass)
+            .setContentTitle("Trợ lý câu cá V6")
+            .setContentText("Hệ thống giám sát màn hình đang chạy...")
+            .setSmallIcon(android.R.drawable.ic_menu_slideshow)
             .build()
 
-        startForeground(101, notification)
+        startForeground(1006, notification)
     }
 
     override fun onDestroy() {
         super.onDestroy()
         virtualDisplay?.release()
         mediaProjection?.stop()
-        if (::overlayView.isInitialized) windowManager.removeView(overlayView)
         if (::controlLayout.isInitialized) windowManager.removeView(controlLayout)
     }
 }
